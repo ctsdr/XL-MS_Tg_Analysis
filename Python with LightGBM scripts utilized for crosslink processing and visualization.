@@ -1,0 +1,579 @@
+#XLMS_ToxoGB_2025_v10_publication
+import lightgbm as lgb
+import pandas as pd
+import numpy as np
+import optuna # Import Optuna for hyperparameter optimization
+import logging
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import (
+    accuracy_score,
+    roc_auc_score,
+    confusion_matrix,
+    classification_report,
+)
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
+from datetime import datetime
+import os
+import re  # Ensure regex module is imported for sanitize_filename
+
+# -----------------------------------------------
+# Minimal Logging Setup
+# -----------------------------------------------
+def setup_logging(log_file='lightgbm_workflow.log'):
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+
+    # Clear existing handlers to prevent duplication
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    # Create handlers
+    file_handler = logging.FileHandler(log_file)
+    console_handler = logging.StreamHandler()
+
+    # Set levels
+    file_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.INFO)
+
+    # Create formatters and add to handlers
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+
+    # Add handlers to the logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return logger
+
+# Initialize logger
+logger = setup_logging()
+
+# Example log messages
+logger.info("Logging has been set up successfully.")
+
+# -----------------------------------------------
+# Define the sanitize_filename Function
+# -----------------------------------------------
+def sanitize_filename(name):
+    """
+    Sanitize the feature name to create a safe filename by replacing
+    non-alphanumeric characters with underscores.
+
+    Parameters:
+    - name (str): The original feature name.
+
+    Returns:
+    - str: The sanitized feature name.
+    """
+    # Replace any character that is not alphanumeric or underscore with an underscore
+    return re.sub(r'[^A-Za-z0-9_]+', '_', name)
+
+# -----------------------------------------------
+# 4. Load the Dataset
+# -----------------------------------------------
+# If using Google Colab, mount Google Drive
+try:
+    from google.colab import drive
+    drive.mount('/content/drive')  # This mounts your Google Drive
+    data_path = '/content/drive/MyDrive/Programming/Colab_XLMS_MachineLearning/PPI_full_wFeatures.txt'
+except:
+    # If not using Colab, specify the local path
+    data_path = 'path_to_your_local_data/PPI_full_wFeatures.txt'
+
+# Extract data directory and filename
+data_dir = os.path.dirname(data_path)
+data_filename = os.path.basename(data_path)
+data_name, data_ext = os.path.splitext(data_filename)
+
+# Load the dataset
+df = pd.read_csv(data_path, delimiter='\t')
+logger.info("Dataset loaded successfully.")
+
+# Display dataset information
+logger.info(f"Dataset shape: {df.shape}")
+logger.info(f"Dataset columns: {df.columns.tolist()}")
+
+# -----------------------------------------------
+# Define the Labeling Function and Apply It
+# -----------------------------------------------
+def label_csm_row(row):
+    if row['MS'] == 'noncleaved':
+        return np.nan
+    c = row['PPI.Score']
+    if c < 10:
+        return 0
+    elif c >= 284:
+        return 1
+    else:
+        return np.nan
+
+df['label'] = df.apply(label_csm_row, axis=1)
+
+logger.info("Labeling function applied.")
+
+# Filter out rows with NaN labels (all mediocre hits)
+data_filtered = df[df['label'].notnull()].copy()
+logger.info(f"Filtered dataset shape (after labeling): {data_filtered.shape}")
+
+# -----------------------------------------------
+# 6. Feature Selection
+# -----------------------------------------------
+features = [
+    'Location_matches',
+    'STRING.score',
+    'RnaSeq.min',
+    'ToxoNET_matches',
+    'Computed_GO_Component_IDs_c_matches',
+    'Computed_GO_Function_IDs_c_matches',
+    'Computed_GO_Process_IDs_c_matches',
+    'EC_numbers_from_OrthoMCL_c_matches',
+    'PFam_ID_c_matches',
+    'CRISPR.dif',
+    'NonSyn_Syn_SNP_Ratio_All_Strains.dif',
+    'Number.of.CSMs',
+    'number_unique_RR',
+    'number_unique_intra.min'
+]
+
+# Ensure selected features exist in the dataset
+missing_features = set(features) - set(data_filtered.columns)
+if missing_features:
+    logger.error(f"Missing features in the dataset: {missing_features}")
+    raise ValueError(f"Missing features: {missing_features}")
+
+X = data_filtered[features]
+y = data_filtered['label'].astype(int)
+logger.info("Features and labels extracted.")
+
+# -----------------------------------------------
+# Data Preprocessing: Convert Boolean Features
+# -----------------------------------------------
+# List of features with TRUE, FALSE, NA values
+boolean_features = [
+    'Location_matches',
+    'ToxoNET_matches',
+    'Computed_GO_Component_IDs_c_matches',
+    'Computed_GO_Function_IDs_c_matches',
+    'Computed_GO_Process_IDs_c_matches',
+    'EC_numbers_from_OrthoMCL_c_matches',
+    'PFam_ID_c_matches'
+]
+
+# Replace 'NA' strings with np.nan in the entire dataset
+X.replace('NA', np.nan, inplace=True)
+
+# Diagnose: Check unique values before conversion
+logger.info("Checking unique values in boolean features before conversion:")
+for col in boolean_features:
+    unique_values = X[col].unique()
+    logger.info(f"Unique values in '{col}': {unique_values}")
+
+# Convert boolean features to numeric
+for col in boolean_features:
+    # Strip whitespace and convert to uppercase
+    X[col] = X[col].astype(str).str.strip().str.upper()
+
+    # Map actual unique values to 1/0
+    mapping_dict = {'TRUE': 1, 'FALSE': 0}
+    X[col] = X[col].map(mapping_dict)
+
+    # Ensure the column is of float dtype to accommodate np.nan
+    X[col] = X[col].astype(float)
+
+logger.info("Boolean features converted to numeric.")
+
+# Display a summary to check the conversion
+logger.info("Summary of boolean features after conversion:")
+print(X[boolean_features].describe())
+
+# Display counts of unique values after conversion
+for col in boolean_features:
+    value_counts = X[col].value_counts(dropna=False)
+    logger.info(f"Value counts for '{col}' after conversion:\n{value_counts}")
+
+
+# -----------------------------------------------
+# Split the Data into Training and Test Sets
+# -----------------------------------------------
+# Split data with stratification to maintain class proportions
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.1,  # Set aside 10% for testing
+    stratify=y,
+    random_state=42
+)
+logger.info(f"Training set shape: {X_train.shape}")
+logger.info(f"Test set shape: {X_test.shape}")
+
+# -----------------------------------------------
+# Verify Data Types After Conversion
+# -----------------------------------------------
+logger.info("Data types in training set after conversion:")
+logger.info(X_train.dtypes)
+
+# -----------------------------------------------
+# 8. Prepare LightGBM Dataset for Cross-Validation
+# -----------------------------------------------
+lgb_dataset = lgb.Dataset(
+    X_train,
+    label=y_train,
+    free_raw_data=False
+)
+
+# -----------------------------------------------
+# 9. Define Model Parameters
+# -----------------------------------------------
+params = {
+    'objective': 'binary',
+    'metric': ['auc', 'binary_logloss'],  # 'auc' first for early stopping
+    'boosting_type': 'gbdt',
+    #'num_leaves': 31, it will be tuned by optuna
+    #'learning_rate': 0.05, it will be tuned by optuna
+    'feature_fraction': 0.9,
+    'bagging_fraction': 0.8,
+    'bagging_freq': 5,
+    'verbosity': -1,
+    'random_state': 42,
+    'is_unbalance': True  # Set to True for class imbalance handling
+}
+
+# -----------------------------------------------
+# 10. Hyperparameter Tuning with Optuna
+# -----------------------------------------------
+logger.info("Starting hyperparameter tuning with Optuna.")
+
+def objective(trial):
+    # Define the hyperparameter search space
+    param = {
+        'objective': 'binary',
+        'metric': 'auc',
+        'boosting_type': 'gbdt',
+        'is_unbalance': True,
+        'random_state': 42,
+        'num_leaves': trial.suggest_int('num_leaves', 15, 127),
+        'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.3, log=True),
+        'max_depth': trial.suggest_int('max_depth', 5, 50),
+        'min_child_samples': trial.suggest_int('min_child_samples', 5, 100),
+        'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+        'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 10.0),
+        'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 10.0),
+    }
+
+
+# -----------------------------------------------
+# 11. Set Up Cross-Validation with Callbacks
+# -----------------------------------------------
+    n_splits = 3
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=49)
+
+    logger.info(f"Starting {n_splits}-Fold Stratified Cross-Validation.")
+
+# Define callbacks for cross-validation
+# you need this for Early Stopping.
+    callbacks_cv = [
+    lgb.log_evaluation(period=10),  # Logs every 10 rounds
+    lgb.early_stopping(stopping_rounds=100, verbose=True)
+    ]
+
+# Perform cross-validation with callbacks
+    cv_results = lgb.cv(
+      param, #changed to param from the params !!!
+      lgb_dataset,
+      num_boost_round=1000,
+      folds=skf.split(X_train, y_train),
+      seed=49,
+      stratified=True, #do we need this?
+      callbacks=callbacks_cv
+    )
+
+    # Extract the best score
+    best_score = max(cv_results['valid auc-mean']) #auc-mean is valid auc-mean
+    return best_score
+
+# Create a study object and optimize the objective function
+study = optuna.create_study(direction='maximize', study_name='lightgbm_hyperparameter_tuning')
+study.optimize(objective, n_trials=100)
+
+# Log the best hyperparameters
+logger.info(f"Best hyperparameters found by Optuna: {study.best_params}")
+logger.info(f"Best AUC from Optuna: {study.best_value:.4f}")
+
+# Update the parameters with the best hyperparameters
+params.update(study.best_params)
+
+# Since 'metric' might be overwritten, ensure it's included
+params['metric'] = ['auc', 'binary_logloss']
+
+
+# -----------------------------------------------
+# 12. Train Final Model on Full Training Set with Early Stopping
+# -----------------------------------------------
+logger.info("Training final model with early stopping on validation set using best hyperparameters.")
+
+# Split X_train into final training and validation sets
+X_train_final, X_val, y_train_final, y_val = train_test_split(
+    X_train,
+    y_train,
+    test_size=0.1,  # Allocate 10% for validation
+    stratify=y_train,
+    random_state=49
+)
+logger.info(f"Final Training set shape: {X_train_final.shape}")
+logger.info(f"Validation set shape: {X_val.shape}")
+
+# Create LightGBM Datasets
+lgb_train_final = lgb.Dataset(
+    X_train_final,
+    label=y_train_final,
+    free_raw_data=False
+)
+
+lgb_val = lgb.Dataset(
+    X_val,
+    label=y_val,
+    reference=lgb_train_final,
+    free_raw_data=False
+)
+
+# Define callbacks for final training
+callbacks_train = [
+    lgb.log_evaluation(period=50),  # Logs every 50 rounds
+    lgb.early_stopping(stopping_rounds=100, verbose=True)
+]
+
+# Train the final model with early stopping
+final_model = lgb.train(
+    params,
+    lgb_train_final,
+    num_boost_round=1000,
+    valid_sets=[lgb_val],
+    valid_names=['validation'],
+    callbacks=callbacks_train
+)
+
+logger.info("Final model trained successfully.")
+logger.info(f"Final model best iteration: {final_model.best_iteration}")
+
+# -----------------------------------------------
+# Evaluate the Model on the Test Set
+# -----------------------------------------------
+logger.info("Evaluating the model on the test set.")
+
+# Predict probabilities on the test set
+y_pred_proba = final_model.predict(X_test, num_iteration=final_model.best_iteration)
+
+# For binary classification, set a threshold of 0.5
+y_pred = (y_pred_proba >= 0.5).astype(int)
+
+# Compute performance metrics
+accuracy = accuracy_score(y_test, y_pred)
+roc_auc = roc_auc_score(y_test, y_pred_proba)
+conf_matrix = confusion_matrix(y_test, y_pred)
+classif_report = classification_report(y_test, y_pred)
+
+# Log the performance metrics
+logger.info(f"Test Set Accuracy: {accuracy:.4f}")
+logger.info(f"Test Set ROC AUC: {roc_auc:.4f}")
+logger.info("Confusion Matrix:")
+logger.info(f"\n{conf_matrix}")
+logger.info("Classification Report:")
+logger.info(f"\n{classif_report}")
+
+# Optionally, plot the ROC curve
+from sklearn.metrics import roc_curve, auc
+
+fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba)
+roc_auc_curve = auc(fpr, tpr)
+
+# Plot ROC curve
+plt.figure()
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc_curve:.4f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlim([-0.05, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic - Test Set')
+plt.legend(loc="lower right")
+
+# Save the ROC curve as SVG
+roc_curve_filename = f"{data_name}_ROC_Curve.svg"
+roc_curve_path = os.path.join(data_dir, roc_curve_filename)
+plt.savefig(roc_curve_path, format='svg')
+plt.close()
+logger.info(f"ROC curve saved to {roc_curve_path}")
+
+# -----------------------------------------------
+# 13. Feature Importance
+# -----------------------------------------------
+# Get feature importances
+importance = final_model.feature_importance(importance_type='split')  # or 'gain'
+feature_names = final_model.feature_name()
+
+# Create a DataFrame for visualization
+feature_importance_df = pd.DataFrame({
+    'feature': feature_names,
+    'importance': importance
+})
+
+# Sort the DataFrame
+feature_importance_df = feature_importance_df.sort_values(by='importance', ascending=False)
+
+# Plot
+plt.figure(figsize=(10, 8))
+sns.barplot(x='importance', y='feature', data=feature_importance_df.head(20), palette='magma')
+plt.title('Top 20 Feature Importances')
+plt.xlabel('Importance (split)')
+plt.ylabel('Feature')
+plt.tight_layout()
+
+# Save the feature importance plot as SVG
+feature_importance_filename = f"{data_name}_Feature_Importance.svg"
+feature_importance_path = os.path.join(data_dir, feature_importance_filename)
+plt.savefig(feature_importance_path, format='svg')
+plt.close()
+logger.info(f"Feature importance plot saved to {feature_importance_path}")
+
+# -----------------------------------------------
+# 14. Explainability by SHAP
+# -----------------------------------------------
+logger.info("Calculating SHAP values for model explainability.")
+
+# Create a TreeExplainer for LightGBM
+explainer = shap.TreeExplainer(final_model)
+shap_values = explainer.shap_values(X_train_final)
+
+# Plot SHAP summary
+shap.summary_plot(shap_values, X_train_final, show=False)
+
+# Save the SHAP summary plot as SVG
+shap_summary_filename = f"{data_name}_SHAP_Summary.svg"
+shap_summary_path = os.path.join(data_dir, shap_summary_filename)
+plt.savefig(shap_summary_path, format='svg')
+plt.close()
+logger.info(f"SHAP summary plot saved to {shap_summary_path}")
+
+# -----------------------------------------------
+# Calculate Mean Absolute SHAP Values
+# -----------------------------------------------
+logger.info("Calculating Mean Absolute SHAP values.")
+
+# Compute the mean absolute SHAP value for each feature
+mean_abs_shap = np.abs(shap_values).mean(axis=0)
+shap_importance_df = pd.DataFrame({
+    'feature': X_train_final.columns,
+    'mean_abs_shap': mean_abs_shap
+}).sort_values(by='mean_abs_shap', ascending=False)
+
+# Log the Mean Absolute SHAP values
+logger.info("Mean Absolute SHAP values:")
+for index, row in shap_importance_df.iterrows():
+    logger.info(f"{row['feature']}: {row['mean_abs_shap']:.4f}")
+
+# Plot Mean Absolute SHAP values
+plt.figure(figsize=(10, 8))
+sns.barplot(x='mean_abs_shap', y='feature', data=shap_importance_df.head(20), palette='viridis')
+plt.title('Top 20 Features by Mean Absolute SHAP Values')
+plt.xlabel('Mean |SHAP value|')
+plt.ylabel('Feature')
+plt.tight_layout()
+
+# Save the Mean Absolute SHAP importance plot as SVG
+shap_importance_filename = f"{data_name}_Mean_Absolute_SHAP_Importance.svg"
+shap_importance_path = os.path.join(data_dir, shap_importance_filename)
+plt.savefig(shap_importance_path, format='svg')
+plt.close()
+logger.info(f"Mean Absolute SHAP importance plot saved to {shap_importance_path}")
+
+# -----------------------------------------------
+# Generate and Save SHAP Dependence Plots
+# -----------------------------------------------
+logger.info("Generating SHAP dependence plots for each feature.")
+
+# Create a subdirectory for SHAP dependence plots
+shap_dependence_dir = os.path.join(data_dir, f"{data_name}_SHAP_Dependence_Plots")
+os.makedirs(shap_dependence_dir, exist_ok=True)
+
+for feature in X_train_final.columns:
+    plt.figure()
+    shap.dependence_plot(
+        feature,
+        shap_values,
+        X_train_final,
+        show=False,
+        interaction_index=None  # Set to None to not color by any feature
+    )
+
+    # Define the filename by appending the sanitized feature name to the data file name
+    sanitized_feature = sanitize_filename(feature)
+    shap_dependence_filename = f"{data_name}_SHAP_Dependence_{sanitized_feature}.svg"
+    shap_dependence_path = os.path.join(shap_dependence_dir, shap_dependence_filename)
+
+    # Save the SHAP dependence plot as SVG
+    plt.savefig(shap_dependence_path, format='svg')
+    plt.close()
+    logger.info(f"SHAP dependence plot for '{feature}' saved to {shap_dependence_path}")
+
+# -----------------------------------------------
+# 15. Save the Final Model to a File
+# -----------------------------------------------
+# Construct the new model filename
+model_filename = f"{data_name}_model.txt"  # Using '.txt' as the file extension
+model_path = os.path.join(data_dir, model_filename)
+
+# Save the final model to the model_path
+final_model.save_model(model_path)
+logger.info(f"Final model saved to {model_path}")
+
+# -----------------------------------------------
+# Use the Trained Model to Predict on the Full Dataset
+# -----------------------------------------------
+logger.info("Loading the original dataset for full prediction.")
+
+# Load the original dataset
+df_full = pd.read_csv(data_path, delimiter='\t')
+logger.info("Original dataset loaded successfully.")
+
+# Extract features
+X_full = df_full[features]
+# Replace 'NA' strings with np.nan in the entire dataset
+X_full.replace('NA', np.nan, inplace=True)
+# Convert boolean features to numeric
+for col in boolean_features:
+    # Strip whitespace and convert to uppercase
+    X_full[col] = X_full[col].astype(str).str.strip().str.upper()
+
+    # Map actual unique values to 1/0
+    mapping_dict = {'TRUE': 1, 'FALSE': 0}
+    X_full[col] = X_full[col].map(mapping_dict)
+
+    # Ensure the column is of float dtype to accommodate np.nan
+    X_full[col] = X_full[col].astype(float)
+
+# Display a summary to check the conversion
+logger.info("Summary of boolean features after conversion:")
+print(X_full[boolean_features].describe())
+
+#use the same model to predict the probability for each observation in X_full and append it to the df_full as a column named "lightGBM_prob"
+
+# Predict probabilities using the trained final_model
+y_full_pred_proba = final_model.predict(
+    X_full,
+    num_iteration=final_model.best_iteration
+)
+
+# Append the predicted probabilities to df_full as a new column
+df_full['lightGBM_prob'] = y_full_pred_proba
+logger.info("Predicted probabilities appended to df_full as 'lightGBM_prob'.")
+
+# Optionally, save the updated df_full to a new file
+# Define the output filename
+output_filename = f"{data_name}_with_lightGBM_probabilities.tsv"
+output_path = os.path.join(data_dir, output_filename)
+# Save as a TSV file
+df_full.to_csv(output_path, sep='\t', index=False)
+logger.info(f"Updated df_full with probabilities saved to {output_path}")
