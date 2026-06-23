@@ -1,0 +1,1672 @@
+---
+title: "XLMS scripts"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+```
+
+#Load the clean full XLMS dataframe 
+```{r}
+#read the "crosslinks" (= peptide pairs level) results from the Annika 2.0 results
+rawdf <- read.table("TachyAll_XL_publication_20240916_Crosslinks.txt", header = TRUE, sep = "\t")
+
+#removes suffix on protein names and isoform designation
+rawdf <- rawdf %>%
+  mutate(across(where(is.character), ~str_replace_all(., "-t26_1-p1", ""))) %>%
+  mutate(across(where(is.character), ~str_replace_all(., "\\.P\\d{2,4}", "")))%>% #remove isoform
+  #remove unnecessary columns
+  #select(-c(Crosslinks., Checked, Crosslinker, Number.of.Proteins,)) %>%
+  mutate(MS = "cleaved") #add MS method as cleaved
+
+#make the descriptions easy to read
+# Define a function to clean specified columns with specific patterns, prefix removal, and custom string removals
+clean_gene_product <- function(data, columns) {
+  # Apply multiple transformations within mutate across the specified columns
+  data %>% 
+    mutate(across(all_of(columns), ~if_else(
+      str_starts(., "transcript"),  # Check if starts with "transcript"
+      str_split(., "\\|", simplify = TRUE)[, 4],  # Split and select the 4th element if condition is met
+      .  # Keep the original value if condition is not met
+    ))) %>%
+    mutate(across(all_of(columns), ~str_remove(., "^\\s*gene_product="))) %>%  # Remove the "gene_product=" prefix
+    mutate(across(all_of(columns), ~str_remove(., "dense granule protein "))) %>%  # Remove "dense granule protein " prefix
+    mutate(across(all_of(columns), ~str_remove(., "ribosomal protein "))) %>%  # Remove "ribosomal protein " prefix
+    mutate(across(all_of(columns), ~str_remove(., "SAG-related sequence "))) %>%  # Remove "SAG-related sequence
+    mutate(across(all_of(columns), ~str_remove(., "heat shock protein ")))  # Remove "heat shock protein " prefix
+}
+
+# apply that funciton to df
+rawdf <- clean_gene_product(rawdf, c("Protein.Descriptions.A", "Protein.Descriptions.B"))
+```
+#ambiguous spectral hits that mapped multiple proteins ->
+1. Remove ambiguous hits
+2. Only keep the most abundant one based on the tachyzoite transcriptome
+
+#1. Remove them.
+```{r}
+#  #remove ambiguous peptides matching multiple proteins
+rawdf2 <- rawdf %>% filter(!str_detect(Accession.A, ";") & !str_detect(Accession.B, ";"))
+```
+
+#2. Only keep the most abundant one based on the tachyzoite transcriptome
+```{r}
+#load feature data frame (see later section for how it was made)
+RnaSeqDF <- read.table(file = "ToxoDB67_AllFeature_woSTRING.txt", sep = "\t", header = TRUE) %>%
+  select(Gene_ID, RnaSeq)
+
+rawdf2 <- rawdf %>%
+  #label the ambiguous hits. A for peptide A, B for peptide B, False for non-ambiguous
+  mutate(
+    Ambiguous = case_when(
+      str_detect(Accession.A, ";") ~ "A",  # Label A if Accession.A contains ";"
+      str_detect(Accession.B, ";") ~ "B",  # Label B if Accession.B contains ";"
+      TRUE ~ "False"  # All other cases
+    )) %>%
+  separate_rows(Accession.A, In.protein.A, sep = ";") %>% #split multiple observations in peptide A
+  mutate(Accession.A = str_trim(Accession.A)) %>% #remove the white space
+  left_join(RnaSeqDF, by = c("Accession.A" = "Gene_ID")) %>%
+  group_by(Crosslinks.Peptide.Group.ID) %>% #Group by the original identifier
+  arrange(desc(RnaSeq), In.protein.A) %>%  # Sort by RnaSeq first and then In.protein.A as a tiebreaker
+  slice_head(n = 1) %>% # Keep only the first row per group after sorting
+  select(-RnaSeq) %>% #remove the RnaSeq column
+  ungroup() %>%
+  #perform the same with peptide B
+  separate_rows(Accession.B, In.protein.B, sep = ";") %>% #split multiple observations in peptide B
+  mutate(Accession.B = str_trim(Accession.B)) %>% #remove the white space
+  left_join(RnaSeqDF, by = c("Accession.B" = "Gene_ID")) %>%
+  group_by(Crosslinks.Peptide.Group.ID) %>% #Group by the original identifier
+  arrange(desc(RnaSeq), In.protein.B) %>%  # Sort by RnaSeq first and then In.protein.A as a tiebreaker
+  slice_head(n = 1) %>%  # Keep only the first row per group after sorting
+  select(-RnaSeq) %>% #remove the RnaSeq column
+  ungroup()
+```
+
+# RRI condensation
+#Aggregate peptide-peptide level into residue-residue level interactions (RRI)
+```{r}
+RRIdf <- rawdf2 %>%
+  #add Decoy.Pair column with TT/TD/DD for FDR calculation 
+  rowwise() %>%
+  mutate(
+    Decoy.Pair = case_when(
+      # both Accession.A and Accession.B are empty or NA
+      (is.na(Accession.A) | Accession.A == "") &
+      (is.na(Accession.B) | Accession.B == "") ~ "DD",
+      
+      # exactly one of them is empty/NA → “TD”
+      (is.na(Accession.A) | Accession.A == "") &
+      !(is.na(Accession.B) | Accession.B == "") ~ "TD",
+      
+      !(is.na(Accession.A) | Accession.A == "") &
+      (is.na(Accession.B) | Accession.B == "") ~ "TD",
+      
+      # if neither is empty/NA → “TT”
+      TRUE ~ "TT"
+    )
+  ) %>%
+  ungroup() %>%
+  #Give unique decoy ID so that they don't collapse into one DD
+  # 1) Tag every row/column for “is empty?”
+  mutate(
+    is_empty_A = is.na(Accession.A) | Accession.A == "",
+    is_empty_B = is.na(Accession.B) | Accession.B == ""
+  ) %>%
+   # 2) Compute total number of empty cells across A+B (same for every row)
+  mutate(total_empty = sum(is_empty_A) + sum(is_empty_B)) %>%
+  
+  # 3) Generate exactly `total_empty` unique 6-digit random numbers, 
+  #    zero-pad them, and prepend “DECOY_”; store as a list-column `all_decoys`
+  mutate(all_decoys = list(
+    str_c(
+      "DECOY_",
+      str_pad(
+        sample(0:999999, size = total_empty[1], replace = FALSE),
+        width = 6,
+        pad = "0"
+      )
+    )
+  )) %>%
+  
+  # 4) Assign a row-wise index for each empty spot in A and B:
+  #    - “index_A” runs 1, 2, … across all rows where is_empty_A == TRUE
+  #    - “index_B” runs (1 + #empty_A), (2 + #empty_A), … across rows where is_empty_B == TRUE
+  mutate(
+    # Within all rows, do a running count of TRUEs in is_empty_A
+    index_A = if_else(is_empty_A, cumsum(is_empty_A), NA_integer_),
+    # For B, offset its cumsum by sum(is_empty_A) so IDs don’t collide
+    index_B = if_else(is_empty_B, cumsum(is_empty_B) + sum(is_empty_A), NA_integer_)
+  ) %>%
+  
+  # 5) Now pull from the “all_decoys” vector to fill each empty cell:
+  mutate(
+    Accession.A = if_else(
+      is_empty_A,
+      # pick the index-th decoy from all_decoys[[1]]
+      all_decoys[[1]][index_A],
+      Accession.A
+    ),
+    Accession.B = if_else(
+      is_empty_B,
+      all_decoys[[1]][index_B],
+      Accession.B
+    )
+  ) %>%
+  
+  # 6) Drop all helper columns
+  select(-is_empty_A, -is_empty_B, -total_empty, -all_decoys, -index_A, -index_B) %>%
+  
+  #Add 0 to the decoy's residue number  
+    mutate(across(
+    c(In.protein.A, In.protein.B),
+    ~ if_else(is.na(.) | . == "", "0", .)
+  )) %>%
+  mutate(across(c(In.protein.A, In.protein.B), as.numeric)) %>%
+
+  # --- (a) Create Residue‐to‐Residue Interaction (RRI) label --- #
+  rowwise() %>%
+  mutate(
+    RRI = {
+      # build the two “protein:position” strings on the fly
+      R1 <- str_c(Accession.A, In.protein.A, sep = ":")
+      R2 <- str_c(Accession.B, In.protein.B, sep = ":")
+      # sort them and paste with “-”
+      paste(sort(c(R1, R2)), collapse = "-")
+    }
+  ) %>%
+  ungroup() %>%
+  
+  # --- (b) Aggregate all peptide‐level entries sharing the same RRI --- #
+  group_by(RRI) %>%
+  mutate(
+    Number.of.CSMs = sum(Number.of.CSMs),  # replace by group sum
+    RRI.Score = sqrt(sum(Best.CSM.Score^2)) #Euclidean-norm of Best.CSM.Score
+  ) %>%
+  slice_max(order_by = Best.CSM.Score, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  
+  # --- (c) Create Protein‐to‐Protein Interaction (PPI) label --- #
+  rowwise() %>%
+  mutate(
+    PPI = paste(sort(c(Accession.A, Accession.B)), collapse = "-")
+  ) %>%
+  ungroup()
+```
+#PPI condensation
+#Aggregate RRI to PPI
+```{r}
+PPIdf <- RRIdf %>%
+  # --- Aggregate all peptide‐level entries sharing the same PPI --- #
+  group_by(PPI) %>%
+  mutate(
+    number_unique_RR  = n(),                              # count how many RRI rows are in this PPI group
+    Number.of.CSMs  = sum(Number.of.CSMs),               # sum CSMs over all RRIs in the group
+    PPI.Score       = sqrt(sum(RRI.Score^2))             # Euclidean‐norm of all RRI.Score in this PPI
+  ) %>%
+  slice_max(order_by = RRI.Score, n = 1, with_ties = FALSE) %>%
+  ungroup()
+```
+
+
+#Calculate FDR at RRI level
+```{r}
+RRIfdrcalc <- RRIdf %>%
+  filter(Crosslink.Type == "Inter") %>%
+  #1) arrange so that highest score to lowest score
+  arrange(desc(RRI.Score)) %>%
+  #2) add cumulative counts
+  mutate(
+    CumTD = cumsum(Decoy.Pair == "TD"),
+    CumDD = cumsum(Decoy.Pair == "DD"),
+    CumTT = cumsum(Decoy.Pair == "TT"),
+    RRI_FDR = (CumTD - CumDD)/CumTT)
+
+desired_FDRs <- c(0.01, 0.05, 0.10, 0.30, 0.50)
+
+cutoff_table_RRI <- tibble(FDR_target = desired_FDRs) %>%
+  mutate(
+    cutoff_score = map_dbl(FDR_target, ~ {
+      tmp <- RRIfdrcalc %>%
+        filter(RRI_FDR <= .x)
+      if (nrow(tmp) == 0) {
+        # no row ever achieves FDR <= .x → return NA
+        NA_real_
+      } else {
+        # take the bottommost (lowest‐score) row among those that pass
+        tmp %>%
+          slice_tail(n = 1) %>%
+          pull(RRI.Score)
+      }
+    })
+  )
+
+cutoff_table_RRI
+
+```
+
+
+
+#Calculate FDR at PPI level after separating Interlinks from Intralinks.
+```{r}
+PPIfdrcalc <- PPIdf %>%
+  filter(Crosslink.Type == "Inter") %>%
+  #1) arrange so that highest score to lowest score
+  arrange(desc(PPI.Score)) %>%
+  #2) add cumulative counts
+  mutate(
+    CumTD = cumsum(Decoy.Pair == "TD"),
+    CumDD = cumsum(Decoy.Pair == "DD"),
+    CumTT = cumsum(Decoy.Pair == "TT"),
+    PPI_FDR = (CumTD - CumDD)/CumTT)
+
+desired_FDRs <- c(0.01, 0.05, 0.10, 0.30, 0.50)
+
+cutoff_table_PPI <- tibble(FDR_target = desired_FDRs) %>%
+  mutate(
+    cutoff_score = map_dbl(FDR_target, ~ {
+      tmp <- PPIfdrcalc %>%
+        filter(PPI_FDR <= .x)
+      if (nrow(tmp) == 0) {
+        # no row ever achieves FDR <= .x → return NA
+        NA_real_
+      } else {
+        # take the bottommost (lowest‐score) row among those that pass
+        tmp %>%
+          slice_tail(n = 1) %>%
+          pull(PPI.Score)
+      }
+    })
+  )
+
+cutoff_table_PPI
+```
+
+#Check the FDR at residue-residue level and score
+%FDR 1, 5, 10, 30, 50
+235 183 161 126 108 Tachy all 2024-09-16
+284 253 230 180 159 recalculated at RRI
+284 261 238 189 164 recalculated at PPI
+270 208 183 147 130 Toxo+Human all 2024-09-16
+
+
+```{r}
+
+```
+
+
+#relabel the Confidence levels with Confidence.Q, make PPI and RRI
+```{r}
+#------------------RRI
+# get rid of decoy
+RRI_clean <- RRIdf %>% filter(Decoy == "False") %>%
+# Modify 'Confidence' based on new conditions
+  arrange(desc(RRI.Score)) %>%
+  mutate(Confidence_RRI = case_when(
+    Crosslink.Type == "Intra" ~ Confidence, # Keep original values from the column Confidence for intralinks
+    RRI.Score > cutoff_table_RRI %>% filter(FDR_target == 0.01) %>% pull(cutoff_score) ~ "High", # FDR <1%
+    RRI.Score > cutoff_table_RRI %>% filter(FDR_target == 0.05) %>% pull(cutoff_score) ~ "Medium", # FDR <5%
+    RRI.Score > cutoff_table_RRI %>% filter(FDR_target == 0.10) %>% pull(cutoff_score) ~ "Low", # FDR <10%
+    RRI.Score > cutoff_table_RRI %>% filter(FDR_target == 0.30) %>% pull(cutoff_score) ~ "Purgatory", # FDR <30%
+    RRI.Score <= cutoff_table_RRI %>% filter(FDR_target == 0.30) %>% pull(cutoff_score) ~ "Hell", # FDR >30%
+    TRUE ~ Confidence # Default to keep original in all other cases
+  ))
+
+#add quantitative confidence
+# Define a named vector for the mapping
+confidence_map <- c("High" = 5, "Medium" = 4, "Low" = 3, "Purgatory" = 2, "Hell" = 1)
+# Apply the mapping to the Confidence.Q column
+RRI_clean <- RRI_clean %>%
+  mutate(Confidence.Q = confidence_map[Confidence_RRI])
+
+#------------------PPI
+# get rid of decoy
+PPI_clean <- PPIdf %>% filter(Decoy == "False") %>%
+# Modify 'Confidence' based on new conditions
+  arrange(desc(PPI.Score)) %>%
+  mutate(Confidence_PPI = case_when(
+    Crosslink.Type == "Intra" ~ Confidence, # Keep original values from the column Confidence for intralinks
+    PPI.Score > cutoff_table_PPI %>% filter(FDR_target == 0.01) %>% pull(cutoff_score) ~ "High", # FDR <1%
+    PPI.Score > cutoff_table_PPI %>% filter(FDR_target == 0.05) %>% pull(cutoff_score) ~ "Medium", # FDR <5%
+    PPI.Score > cutoff_table_PPI %>% filter(FDR_target == 0.10) %>% pull(cutoff_score) ~ "Low", # FDR <10%
+    PPI.Score > cutoff_table_PPI %>% filter(FDR_target == 0.30) %>% pull(cutoff_score) ~ "Purgatory", # FDR <30%
+    PPI.Score <= cutoff_table_PPI %>% filter(FDR_target == 0.30) %>% pull(cutoff_score) ~ "Hell", # FDR >30%
+    TRUE ~ Confidence # Default to keep original in all other cases
+  ))
+
+#add quantitative confidence
+# Define a named vector for the mapping
+confidence_map <- c("High" = 5, "Medium" = 4, "Low" = 3, "Purgatory" = 2, "Hell" = 1)
+# Apply the mapping to the Confidence.Q column
+PPI_clean <- PPI_clean %>%
+  mutate(Confidence.Q = confidence_map[Confidence_PPI])
+
+```
+###get the summary of the counts in the confidence intervals at RRI level
+```{r}
+# 1. Count per Crosslink.Type × Confidence.Q
+counts_RRI <- RRI_clean %>% 
+  count(Crosslink.Type, Confidence.Q) %>% 
+  # 2. Pivot so each Confidence.Q becomes its own column
+  pivot_wider(
+    names_from   = Confidence.Q,
+    values_from  = n,
+    names_prefix = "Q",
+    values_fill  = 0
+  )
+
+counts_RRI
+```
+
+
+###get the summary of the counts in the confidence intervals at PPI level
+
+```{r}
+# 1. Count per Crosslink.Type × Confidence.Q
+counts_PPI <- PPI_clean %>% 
+  count(Crosslink.Type, Confidence.Q) %>% 
+  # 2. Pivot so each Confidence.Q becomes its own column
+  pivot_wider(
+    names_from   = Confidence.Q,
+    values_from  = n,
+    names_prefix = "Q",
+    values_fill  = 0
+  )
+
+counts_PPI
+```
+
+```{r}
+# RRI.Score
+ggplot(PPI_clean, aes(RRI.Score)) +
+  geom_histogram(bins = 100, color = "black", fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "RRI.Score Distribution", x = "RRI.Score", y = "Count")
+
+# PPI.Score
+ggplot(PPI_clean, aes(PPI.Score)) +
+  geom_histogram(bins = 100, color = "black", fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "PPI.Score Distribution", x = "PPI.Score", y = "Count")
+
+# Best.CSM.Score
+ggplot(PPI_clean, aes(Best.CSM.Score)) +
+  geom_histogram(bins = 100, color = "black", fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "Best.CSM.Score Distribution", x = "Best.CSM.Score", y = "Count")
+
+
+```
+#for PPI, calculate number of unique intra link for each protein and append
+```{r}
+#calculate number of unique intralinks for each protein at FDR <10% to use for feature
+intracalc <- RRI_clean %>%
+    filter(Decoy == "False") %>%
+    filter(Confidence.Q >= 1) %>% # include all #This is FDR of <10%
+    filter(Crosslink.Type == "Intra") %>%
+  group_by(Accession.A) %>%
+  mutate(number_unique_intra = n()) %>%
+  ungroup()%>%  # Optionally, remove the grouping information
+  group_by(Accession.A) %>%
+    # Select the row with the highest 'Best.CSM.Score' for each 'PPI'
+    filter(Confidence.Q == max(Confidence.Q)) %>%
+    ungroup() %>%
+    distinct(Accession.A, .keep_all = TRUE)%>% #remove redundancy
+    select(Accession.A, number_unique_intra) #select ID and interlink number
+
+#append unique intralinks (keep the smaller of two to represent the uncertinity of the peptide)
+PPI_clean <- PPI_clean %>% 
+  left_join(intracalc, by = "Accession.A") %>%
+  left_join(intracalc, by = c("Accession.B" = "Accession.A")) %>%
+  # Replace NA with 0 and compute the minimum of 'number_unique_intra.x' and 'number_unique_intra.y'
+  mutate(number_unique_intra.min = pmin(replace_na(number_unique_intra.x, 0), replace_na(number_unique_intra.y, 0), na.rm = TRUE)) %>%
+  # Remove the old columns 'number_unique_intra.x' and 'number_unique_intra.y'
+  select(-number_unique_intra.x, -number_unique_intra.y)
+```
+
+#write PPI and RRI into files
+```{r}
+#Write the uncondensed data into a text file #Excel can't hold too many characters per cell. Use text insted.
+write.table(RRI_clean, file = "RRI_Cleaved_woFeatures_20250610.txt", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE) 
+write.table(PPI_clean, file = "PPI_Cleaved_woFeatures_20250610.txt", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE) #for Cytoscape, remove quote 
+```
+# write a gene list for GO term analysis
+```{r}
+PPI.go <- PPI_clean %>%
+            filter(Confidence.Q == 5,
+                   Crosslink.Type == "Inter") %>%
+            select(Accession.A, Accession.B) %>%
+            pivot_longer(everything(), values_to = "accession") %>%
+            distinct(accession) %>%
+            pull(accession) %>%
+            paste(collapse = ",")
+
+writeLines(PPI.go, "PPI_genelist_GOterm_20250610.txt") 
+```
+
+
+##################################################################################################
+#Constructing Features for Machine Learning (skip if using the FeaturesDF from a backup file)
+```{r}
+#Features from ToxoDB and ToxoNET
+featureDF <- read_excel("ToxoDB67_GO_TGME49.xlsx") %>%
+  rename_with(~ gsub(" ", "_", .x))%>% #excel has space in the column name. replace with "_"
+  rename_with(~ gsub("/", "_", .x)) #also remove "/" from the column name
+  # Function to concatenate unique values of a vector
+concat_unique <- function(x) {
+  unique_x <- unique(x)
+  str_c(unique_x[!is.na(unique_x)], collapse = ";")
+}
+
+featureDF <- featureDF %>%
+  group_by(Gene_ID) %>%
+  summarise(across(everything(), ~concat_unique(.x), .names = "{.col}_c"), .groups = 'drop')
+
+# Function to remove redundancy within each cell and concatenate back
+clean_values <- function(x) {
+  # Ensure that x is a character vector
+  x <- as.character(x)
+  # Apply the cleaning process
+  str_split(x, pattern = ";") %>% 
+    map(~.x[.x != "N/A"]) %>%  # Remove "N/A" values
+    map(~.x[.x != "GO:0016020"]) %>%  # Remove the specific element "GO:0016020"
+    map(unique) %>%  # Remove duplicate values
+    map_chr(~str_c(.x, collapse = ";"))
+}
+
+# Apply the function across all columns of the dataframe
+featureDF <- featureDF %>%
+  mutate(across(everything(), clean_values))
+
+#combine CRISPR data to featureDF
+CRISPRdf <- read_excel("ToxoDB67_CRISPR.xlsx")%>%
+  rename_with(~ gsub(" ", "_", .x))%>% #replace space with "_"
+  mutate(Gene_ID = str_replace_all(Gene_ID, "TGGT1_", "TGME49_"))
+featureDF <- left_join(featureDF, CRISPRdf, by = "Gene_ID")
+
+#load ToxoNET data and combine to featureDF
+ToxoNETdf <- read_excel("ToxoNETclusters.xlsx")%>%
+  separate_rows(Components, sep = ",")%>%
+  select(Components, Cluster)%>%
+  group_by(Components) %>% summarise(Cluster = paste(unique(Cluster), collapse = ";")) %>% 
+  ungroup()%>%
+  rename(Gene_ID = Components, ToxoNET = Cluster) #rename column names
+
+#append ToxoNET feature to the main feature data frame
+featureDF <- left_join(featureDF, ToxoNETdf, by = "Gene_ID")
+
+featureDF <- featureDF %>% 
+  select(-source_id_c, -Product_Description_c)%>%
+  rename(RnaSeq = "Stage-specific_RNA-sequencing_in_Toxoplasma_gondii_-_24h_tachyzoites_-_unique_(Toxoplasma_gondii)_c")
+
+#load hyperLOPIT data and add to featureDF
+LOPITdf <- read_excel("ToxoDB67_LOPIT_TGME49.xlsx")%>%
+  rename_with(~ gsub(" ", "_", .x))%>% #replace space with "_"
+  select(Gene_ID, Location)%>%
+  filter(Location != "outlier")%>% #remove outliers
+  group_by(Gene_ID) %>% summarise(Location = paste(unique(Location), collapse = ";")) %>% ungroup()
+featureDF <- left_join(featureDF, LOPITdf, by = "Gene_ID")
+featureDF <- featureDF %>% mutate(across(everything(), ~na_if(.x, ""))) #add na to empty cells
+
+#STRING!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+###############perform only once to get all STRING names and search with UniProt ID Mapping#########
+# STRINGdf <- read.table("432359.protein.links.detailed.v12.0.txt", header = TRUE, sep = " ")
+# STRINGnames <- STRINGdf %>%
+#   # Extract the part after the "." in both columns
+#   mutate(across(c(protein1, protein2), ~str_extract(., "(?<=\\.).+"))) %>%
+#   # Transform the data to a long format
+#   pivot_longer(cols = c(protein1, protein2), values_to = "STRINGnames") %>%
+#   # Select only the STRINGnames column
+#   select(STRINGnames) %>%
+#   # Remove duplicate entries
+#   distinct() %>%
+#   # Optionally, you might want to remove NA values if any extraction failed
+#   drop_na()
+# # Combine all values in the "STRINGnames" column, separated by a space
+# combined_string <- paste(STRINGnames$STRINGnames, collapse = " ")
+# # Save the combined string to a text file -> use UniProt ID Mapping to get VEG names
+# writeLines(combined_string, "STRINGnames.txt")
+
+#read UniProt ID Mapped gene names for STRING
+aliasdf <- read.table("STRINGnames_idmapping_2024_04_11.tsv", header = TRUE, sep = "\t") %>%
+  mutate(To = str_extract(To, "(?<=:).*")) %>% # Modify the "To" column to keep only the part after the ":"
+  mutate(To = str_replace_all(To, "TGVEG_", "TGME49_")) %>% #replace the VEG to ME49 gene name
+  mutate(To = str_replace(To, "[A-Z]$", ""))%>% #remove the last alphabet in the gene names
+  rename(UPname = From, MEname = To) #change name to Uniprot name and ME49 name
+
+#read STRING network data and shape it for processing
+STRINGdf <- read.table("432359.protein.links.detailed.v12.0.txt", header = TRUE, sep = " ")%>%
+  mutate(across(c(protein1, protein2), ~str_extract(., "(?<=\\.).+")))%>% # keep the part after the "."
+  left_join(aliasdf, by = c("protein1" = "UPname")) %>% #add TG name for protein1
+  rename(Accession.A= MEname) %>%
+  left_join(aliasdf, by = c("protein2" = "UPname")) %>% #add TG name for protein2
+  rename(Accession.B= MEname)  %>%
+  filter(!is.na(Accession.A) & !is.na(Accession.B)) %>% #remove na containing rows
+  rowwise() %>%
+    mutate(PPI = paste(sort(c(Accession.A, Accession.B)), collapse = "-")) %>% #join two proteins to make PPI ID
+    ungroup() %>%   
+  select(PPI, combined_score)%>% #just get the PPI and score
+  distinct(PPI, .keep_all = TRUE)%>% #just keep the unique (remove 2x redundancy)
+  rename(STRING.score = combined_score) #rename the column name score to reflect STRING
+#load STRING data to Feature DF
+write.table(STRINGdf, file = "ToxoDB67_AllSTRING.txt", sep = "\t", row.names = FALSE, col.names = TRUE) 
+
+#Write the features into a text file
+write.table(featureDF, file = "ToxoDB67_AllFeature_woSTRING.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+```
+
+
+##### pLink search reports processing ####
+perform pLink3 search with FDR at 10, 5, 1% at PPI level
+#pLink report table has incovenitent shape to read and use for downstream. Use "Peptide_Order" as identifyer, separate summary from observation, find the max scores, calculate total PSM, and append to summary.
+```{r}
+# Define the column names
+column_names <- c("Peptide_Order", "Protein", "Unique_Peptide_Number", "Number.of.CSMs", "Precursor_Mass", "Peptide", "Peptide_Mass",                   "Modifications", "Evalue", "Score", "Da", "ppm", "Alpha_Evalue", "Beta_Evalue")
+#read the pLink full data (largest one)
+pLinkrawdf <- read.table(
+  "pLink_cross-linked_sitesFDR10.csv", 
+  #"pLink_cross-linked_sitesFDR05.csv", 
+  #"pLink_cross-linked_sitesFDR01.csv", 
+                  col.names = column_names, 
+                  header = FALSE, 
+                  sep = ",", 
+                  fill = TRUE, 
+                  stringsAsFactors = FALSE,
+                  na = c("", "NA"),
+                  skip = 2) %>%
+#removes suffix on protein names
+  mutate(across(where(is.character), ~str_replace_all(., "-t26_1-p1", "")))%>%
+  mutate(Protein = str_remove_all(Protein, "\\.P\\d{2,4}"))%>%
+#convert probablity score to -log10
+  mutate(Score = -log10(Score))%>%
+#from the summary rows, add the Peptide_Order to the individual observations below
+# Fill NA values in "Peptide_Order" with the previous non-NA value. This will be the key ID for two data frames
+  mutate(Peptide_Order = str_replace_all(Peptide_Order, "[^0-9\\.]", "") %>% as.numeric())%>% #remove "SameSet" characters
+  fill(Peptide_Order, .direction = "down")
+
+#create summary data frame by "Protein" column is character
+summarydf <- pLinkrawdf %>% filter(str_detect(Protein, "^[A-Z]"))%>%
+                        select(-c(Precursor_Mass,Peptide,Peptide_Mass, Da, ppm, Alpha_Evalue, Beta_Evalue, Modifications, Peptide_Mass, Evalue, Score))
+#Create observationdf: All other rows. keep entire observations with the highest Score per Peptide_Order
+observationdf <- pLinkrawdf %>%
+  filter(!str_detect(Protein, "^[A-Z]")) %>%                # Exclude rows where Protein starts with a capital letter
+  group_by(Peptide_Order) %>%                               # Group by Peptide_Order
+  slice_max(order_by = Score, n = 1, with_ties = FALSE) %>% # Keep the row with the highest Score per group
+  ungroup() %>%
+  select(c(Peptide_Order, Peptide, Score ))
+#combine the best CSM score's observation to the summary
+merged_summary <- summarydf %>% left_join(observationdf, by = "Peptide_Order") %>%
+#split the Protein into Accession.A and B
+  separate_rows(Protein, sep = "/")%>%
+  filter(!is.na(Protein) & Protein != "")%>%
+  separate(Protein, into = c("Accession.A", "Accession.B"), sep = "-", remove = FALSE)%>%
+  # Separate Accession.A into Accession.A and In.protein.A
+  separate(
+    Accession.A,
+    into = c("Accession.A", "In.protein.A"),
+    sep = " ",                # Split at the first space
+    extra = "merge",          # Merge any additional splits into the second column
+    fill = "right"            # If there's no second part, fill with NA
+  ) %>%
+  # Clean In.protein.A by removing parentheses and any remaining whitespace
+  mutate(
+    In.protein.A = str_remove_all(In.protein.A, "[\\(\\)]")
+  ) %>%
+  # Repeat the separation for Accession.B
+  separate(
+    Accession.B,
+    into = c("Accession.B", "In.protein.B"),
+    sep = " ",                # Split at the first space
+    extra = "merge",          # Merge any additional splits into the second column
+    fill = "right"            # If there's no second part, fill with NA
+  ) %>%
+  # Clean In.protein.B by removing parentheses and any remaining whitespace
+  mutate(
+    In.protein.B = str_remove_all(In.protein.B, "[\\(\\)]")
+  ) %>%
+  # Check if they are Intra or Inter crosslinks
+  mutate(Crosslink.Type = if_else(
+    Accession.A == Accession.B,   # Condition
+    "Intra",                       # Value if TRUE
+    "Inter"                        # Value if FALSE
+  )) %>%
+  #Create PPI by %>%
+  rowwise() %>%  # Apply operations row-wise
+  mutate(
+    # Combine accessions into a vector, sort them, and paste with "-"
+    PPI = (paste(sort(c(Accession.A, Accession.B)), collapse = "-")
+  )) %>%
+  ungroup() %>%  # Remove row-wise grouping
+  
+  # remove the redundant PPI due to the non-unique peptide (one sequence hits multiple proteins)
+  group_by(Peptide_Order) %>%                   # Group by Peptide_Order
+  slice_min(order_by = PPI, n = 1, with_ties = FALSE) %>%  # Select the first aplhanumerical PPI per group
+  ungroup() %>%
+  
+  #create peptide sequence "Sequence.A" position in peptide "Position.A" and B to be compatible with Annika 2.0
+  separate(Peptide, into = c("Accession1", "Accession2"), sep = "-") %>%
+  mutate(
+    Sequence.A = str_extract(Accession1, "^[A-Za-z]+"),
+    Position.A = as.integer(str_extract(Accession1, "[0-9]+")),
+    Sequence.B = str_extract(Accession2, "^[A-Za-z]+"),
+    Position.B = as.integer(str_extract(Accession2, "[0-9]+"))
+    )%>%
+   #convert pLink format of the peptide to Annika 2.0 format with the target residue in []
+   mutate(
+    Sequence.A = paste0(
+      str_sub(Sequence.A, 1, Position.A - 1),
+      "[", 
+      str_sub(Sequence.A, Position.A, Position.A),
+      "]",
+      str_sub(Sequence.A, Position.A + 1)
+    ),
+      Sequence.B = paste0(
+      str_sub(Sequence.B, 1, Position.B - 1),
+      "[", 
+      str_sub(Sequence.B, Position.B, Position.B),
+      "]",
+      str_sub(Sequence.B, Position.B + 1)
+    )
+  ) %>%
+  # Create Residue to Residue Interaction (RRI)
+  rowwise() %>%  # Apply operations row-wise
+  mutate(
+  RRA = paste(Accession.A, In.protein.A, sep = ":"),
+  RRB = paste(Accession.B, In.protein.B, sep = ":")
+  ) %>%
+  ungroup() %>%
+  rowwise() %>%
+  mutate(RRI = paste(sort(c(RRA, RRB)), collapse = "-"))%>% #sort alphanumerical then combine to make RRI
+  ungroup() %>% # Remove row-wise grouping
+  select(-c(Accession1, Accession2, RRA, RRB)) #remove non-relevent columns
+```
+Perform above script for FDR 10, 5, 1
+save the data frame. Combine them by checking with unique RRI and give them the Confidence.Q
+
+```{r}
+#RRI_noncleaved_FDR10 <- merged_summary
+#RRI_noncleaved_FDR05 <- merged_summary
+#RRI_noncleaved_FDR01 <- merged_summary
+#merge PPI with FDR 1, 5, 10 %. before processing, create the PPI_condensed_FDR01, 05, 10
+RRI_noncleaved_full <- RRI_noncleaved_FDR10 %>%
+  mutate(Confidence.Q = 3) %>%
+  mutate(Confidence.Q = if_else(RRI %in% RRI_noncleaved_FDR05$RRI, 4, Confidence.Q)) %>%
+  mutate(Confidence.Q = if_else(RRI %in% RRI_noncleaved_FDR01$RRI, 5, Confidence.Q)) %>%
+  mutate(MS = "noncleaved") %>%
+  #convert numbers to numeric (need this to do donstream calculations)
+    mutate(across(
+    where(is.character),
+    ~ {
+      # test non-NA entries
+      vals <- .x[!is.na(.x)]
+      if (all(str_detect(vals, "^\\d+(\\.\\d+)?$"))) {
+        as.numeric(.x)
+      } else {
+        .x
+      }
+    }
+  ))
+#export for merging with cleavable data
+write.table(RRI_noncleaved_full, "RRI_noncleaved_woFeatures_20250610.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+#Calculate the number of RRI for aggregated pLink data
+```{r}
+# Compute counts for Total
+total_counts <- RRI_noncleaved_full %>%
+  summarise(
+    FDR10 = sum(Confidence.Q >= 3),
+    FDR05 = sum(Confidence.Q >= 4),
+    FDR01 = sum(Confidence.Q == 5)
+  ) %>%
+  mutate(Category = "Total")
+
+# Compute counts for Intra
+intra_counts <- RRI_noncleaved_full %>%
+  filter(Crosslink.Type == "Intra") %>%
+  summarise(
+    FDR10 = sum(Confidence.Q >= 3),
+    FDR05 = sum(Confidence.Q >= 4),
+    FDR01 = sum(Confidence.Q == 5)
+  ) %>%
+  mutate(Category = "Intra")
+
+# Compute counts for Inter
+inter_counts <- RRI_noncleaved_full %>%
+  filter(Crosslink.Type == "Inter") %>%
+  summarise(
+    FDR10 = sum(Confidence.Q >= 3),
+    FDR05 = sum(Confidence.Q >= 4),
+    FDR01 = sum(Confidence.Q == 5)
+  ) %>%
+  mutate(Category = "Inter")
+
+# Combine all counts into one table
+summary_table <- bind_rows(total_counts, intra_counts, inter_counts) %>%
+  select(Category, FDR10, FDR05, FDR01)  # Arrange columns in desired order
+
+# Print the table
+print(summary_table)
+
+
+```
+
+
+#Merge the cleaved and noncleaved RRI together for Cytoscape and structural mapping
+```{r}
+#merge cleaved/noncleaved for cytoscape
+RRI_noncleaved_full <- RRI_noncleaved_full %>% mutate(MS = "noncleaved") %>%
+  #convert pLink format of the peptide to Annika 2.0 format with the target residue
+   mutate(
+    Sequence.A = paste0(
+      str_sub(Sequence.A, 1, Position.A - 1),
+      "[", 
+      str_sub(Sequence.A, Position.A, Position.A),
+      "]",
+      str_sub(Sequence.A, Position.A + 1)
+    ),
+      Sequence.B = paste0(
+      str_sub(Sequence.B, 1, Position.B - 1),
+      "[", 
+      str_sub(Sequence.B, Position.B, Position.B),
+      "]",
+      str_sub(Sequence.B, Position.B + 1)
+    )
+  )
+
+#make sure RRI_clean from the cleavable Annika data is loaded
+RRI_full <- full_join(RRI_clean, RRI_noncleaved_full, join_by(RRI))%>%
+    #convert numbers to numeric (need this to do downstream calculations)
+    mutate(across(
+      where(is.character),
+      ~ {
+        # test non-NA entries
+        vals <- .x[!is.na(.x)]
+        if (all(str_detect(vals, "^\\d+(\\.\\d+)?$"))) {
+        as.numeric(.x)
+        } else {
+          .x
+        }
+      }
+    ))%>%
+  mutate(
+    MS = case_when( #MS is the MS detection methods
+      !is.na(MS.x) & !is.na(MS.y) ~ "both",  # Both values exist
+      !is.na(MS.x) & (is.na(MS.y)) ~ MS.x, # Only MS.x exists
+      is.na(MS.x) & !is.na(MS.y) ~ MS.y,                   # Only MS.y exists
+      TRUE ~ NA_character_))%>%
+  #select larger of Confidence Q between cleaved and uncleaved
+  mutate(Confidence.Q = pmax(Confidence.Q.x, Confidence.Q.y, na.rm = TRUE)) %>%
+  #Add Number of CSMs
+  mutate(Number.of.CSMs = rowSums(select(., Number.of.CSMs.x, Number.of.CSMs.y), na.rm = TRUE)) %>%
+  #get rid of non-relevant columns
+  select(-c(Confidence, Confidence.Q.x, Confidence.Q.y, Crosslinks.Peptide.Group.ID, 
+            Peptide_Order, Number.of.CSMs.x, Number.of.CSMs.y, MS.x, MS.y, 
+            Protein.Descriptions.A, Protein.Descriptions.B)) %>%
+  # Replace NA in all .x columns with corresponding .y columns
+  mutate(across(ends_with(".x"), ~ coalesce(.x, get(sub("\\.x$", ".y", cur_column()))))) %>%
+  # rename all columns that end with .x and remove the .x from the name 
+  rename_with(
+    .fn = ~ str_replace(., "\\.x$", ""),  # Function to remove '.x' at the end
+    .cols = ends_with(".x")                # Select columns that end with '.x'
+              ) %>%
+  #select usable columns and clean up
+  select(c(RRI, PPI, Accession.A, Accession.B, Confidence.Q, Number.of.CSMs, MS, Sequence.A, Position.A, Sequence.B, Position.B, In.protein.A, In.protein.B, Crosslink.Type, RRI.Score))
+
+name.df <- read.table("GeneNameLookupTableTxHu.tsv", header = TRUE, sep = "\t", quote   = "") %>%
+          select(c(gene, gene_product)) %>%
+          distinct(gene, .keep_all = TRUE) #remove duplicate Toxo genes
+RRI_table <- RRI_full %>% 
+  filter(Confidence.Q != 1) %>%
+  left_join(name.df, by = c("Accession.A" = "gene")) %>%
+  left_join(name.df, by = c("Accession.B" = "gene")) %>%
+  rename(gene_product.A = gene_product.x,
+         gene_product.B = gene_product.y)
+
+#export RRI table for publication for supplementary file
+write.table(RRI_table, "RRI_SupplementaryFile.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+
+#export for downstream analysis
+write.table(RRI_full, "RRI.full.csv", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+#####XMAS formatting for structural mapping################################
+```{r}
+#rearrange the columns for Xlinkx format for XMAS export
+XMASdf <- RRI_full %>% filter(Confidence.Q >= 3) %>% #just get FDR<10% 
+                      mutate(Crosslinks.Peptide.Group.ID = sample(100000:999999, n(), replace = FALSE),
+                              "Modifications A" = "DSBSO",
+                              "Modifications B" = "DSBSO",
+                              "Protein Descriptions A" = "Protein.Descriptions.A", 
+                              "Protein Descriptions B" = "Protein.Descriptions.B",
+                              "Is Decoy" = FALSE
+                              )%>%
+                      select(
+                      Crosslinks.Peptide.Group.ID, 
+                      Crosslinks = 1,
+                      Checked = 1,
+                      `Crosslink Sequence` = 1, 
+                      `Max. XlinkX Score` = 0, 
+                      Crosslinker = 1, 
+                      `Crosslink Type` = Crosslink.Type, 
+                      "# CSMs" = Number.of.CSMs, 
+                      "# Proteins" = 2,
+                      "Sequence A" = Sequence.A, 
+                      "Modifications A", 
+                      "Accession A" = Accession.A, 
+                      "Position A" = Position.A, 
+                      "Sequence B" = Sequence.B, 
+                      "Modifications B", 
+                      "Accession B" = Accession.B, 
+                      "Position B" = Position.B, 
+                      "Protein Descriptions A", 
+                      "Protein Descriptions B", 
+                      "Is Decoy",
+                      "Q-value" = 0,
+                      "# CSMs_1" = Number.of.CSMs)
+#write csv file without using "," because it is in the gene description column
+write.table(XMASdf, "RRI_XMAS.csv", sep = "\t", row.names = FALSE, quote = FALSE)
+
+#select inter and intra
+inter_df <- XMASdf %>% filter(str_detect(`Crosslink Type`, "Inter"))
+intra_df <- XMASdf %>% filter(str_detect(`Crosslink Type`, "Intra"))
+#write csv file without using "," because it is in the gene description column
+write.table(inter_df, "RRI_XMAS_inter.csv", sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(intra_df, "RRI_XMAS_intra.csv", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+#Intra and Inter links distance mapping graphs
+#Analyzing the distance map of intra links
+```{r}
+#import the tsv file that contains distance measurements.
+intra_tsvdf <- read.table("TachyAll_XL_publication_20240916_XMAS_intra_LRibosome.tsv",
+                      header = TRUE, 
+                      fill = TRUE, 
+                      sep = "\t", 
+                      comment.char = "") %>% 
+                  na.omit() %>%
+                  mutate(Crosslink.Type = "intra")
+#Small subunit
+intra_tsvdf2 <- read.table("TachyAll_XL_publication_20240916_XMAS_intra_SRibosome.tsv",
+                      header = TRUE, 
+                      fill = TRUE, 
+                      sep = "\t", 
+                      comment.char = "") %>% 
+                  na.omit() %>%
+                  mutate(Crosslink.Type = "intra")
+#combine both intralinks
+intra_tsvdf <- rbind(intra_tsvdf, intra_tsvdf2)
+
+#import the tsv file that contains distance measurements.
+inter_tsvdf <- read.table("TachyAll_XL_publication_20240916_XMAS_inter_LRibosome.tsv",
+                      header = TRUE, 
+                      fill = TRUE, 
+                      sep = "\t", 
+                      comment.char = "") %>% 
+                  na.omit() %>%
+                  mutate(Crosslink.Type = "inter")
+                  
+#import the tsv file that contains distance measurements.
+inter_tsvdf2 <- read.table("TachyAll_XL_publication_20240916_XMAS_inter_SRibosome.tsv",
+                      header = TRUE, 
+                      fill = TRUE, 
+                      sep = "\t", 
+                      comment.char = "") %>% 
+                  na.omit() %>%
+                  mutate(Crosslink.Type = "inter")
+
+#combine both intralinks
+inter_tsvdf <- rbind(inter_tsvdf, inter_tsvdf2)
+
+# Combine "inter_tsvdf" and "intra_tsvdf" by rows
+distance_df <- rbind(inter_tsvdf, intra_tsvdf)%>%
+  select(Distance..A., Crosslink.Type)
+
+#import the txt file that contains distance measurement of all possible combination of KSTY measured by Pymol
+# Load all possible INTER links
+inter_possible <- read.table(
+  "XMAS_interprotein_ca_distancesKSTY.txt",
+  header = TRUE,
+  sep = "\t",
+  fill = TRUE,
+  fileEncoding = "Windows-1252",  # Pymol script spits out this encode!!!! Otherwise fail to load up.
+  stringsAsFactors = FALSE
+  )%>%
+  mutate(Crosslink.Type = "possible")%>%
+  rename(Distance..A. = Distance..Å.)%>%
+  select(Distance..A., Crosslink.Type)
+
+# Load all possible INTRA links
+intra_possible <- read.table(
+  "XMAS_intra_ca_distancesKSTY.txt",
+  header = TRUE,
+  sep = "\t",
+  fill = TRUE,
+  fileEncoding = "Windows-1252",  # Pymol script spits out this encode!!!! Otherwise fail to load up.
+  stringsAsFactors = FALSE
+  )%>%
+  mutate(Crosslink.Type = "possible")%>%
+  rename(Distance..A. = Distance..Å.)%>%
+  select(Distance..A., Crosslink.Type)
+
+# Load possible inter and intra to the 
+distance_df <- bind_rows(distance_df, inter_possible, intra_possible)
+
+# Calculate statistics for each Crosslink.Type group
+grouped_summary <- distance_df %>%
+  group_by(Crosslink.Type) %>%
+  summarise(
+    Observations = n(),
+    Mean = mean(`Distance..A.`, na.rm = TRUE),
+    Median = median(`Distance..A.`, na.rm = TRUE),
+    SD = sd(`Distance..A.`, na.rm = TRUE)
+  ) %>%
+  ungroup() # Ungroup to prevent grouping affecting further operations
+
+# Calculate overall statistics
+overall_summary <- distance_df %>%
+  summarise(
+    Crosslink.Type = "Overall",
+    Observations = n(),
+    Mean = mean(`Distance..A.`, na.rm = TRUE),
+    Median = median(`Distance..A.`, na.rm = TRUE),
+    SD = sd(`Distance..A.`, na.rm = TRUE)
+  )
+
+# Combine the overall and grouped summaries
+df_summary <- bind_rows(overall_summary, grouped_summary)
+df_summary
+```
+
+
+#ggplot to inter and intra histogram
+```{r}
+library(ggplot2)
+p <- ggplot(distance_df, aes(x = `Distance..A.`, fill = Crosslink.Type)) +
+  geom_density(binwidth = 100, alpha = 0.6, position = "identity") + # Adjust binwidth as necessary
+  scale_fill_manual(
+    values = c(
+      "inter" = "red", 
+      "intra" = "blue", 
+      "possible" = "green"
+    )
+  ) +
+  labs(title = "Frequency Distribution of Distance by Crosslink Type",
+       x = "Distance (A)", 
+       y = "Frequency")
+p
+```
+# Export the graph as an SVG file
+```{r}
+ggsave("XMAS_frequency_distribution_distance_by_crosslink_type.svg", plot = p, device = "svg", width = 6, height = 4)
+```
+#calculate the overlap between cleaved and noncleaved RRI
+```{r}
+# Define FDR levels and their corresponding filter conditions
+fdr_levels <- list(
+  FDR05 = "Confidence.Q >= 4",
+  FDR01 = "Confidence.Q == 5"
+)
+
+# Function to compute counts for a given filter condition
+compute_counts <- function(df_noncleaved, df_cleaved, filter_condition) {
+  
+  # Filter the data based on the provided condition
+  RRI_noncleaved_filtered <- df_noncleaved %>% filter(eval(parse(text = filter_condition)))
+  RRI_cleaved_filtered <- df_cleaved %>% filter(eval(parse(text = filter_condition)))
+  
+  # Total number of observations
+  total_noncleaved <- RRI_noncleaved_filtered %>% summarise(count = n()) %>% pull(count)
+  total_cleaved <- RRI_cleaved_filtered %>% summarise(count = n()) %>% pull(count)
+  
+  # Total unique RRIs
+  unique_noncleaved <- RRI_noncleaved_filtered %>% distinct(RRI) %>% summarise(count = n()) %>% pull(count)
+  unique_cleaved <- RRI_cleaved_filtered %>% distinct(RRI) %>% summarise(count = n()) %>% pull(count)
+  
+  # Shared RRIs
+  shared_rris <- RRI_noncleaved_filtered %>% inner_join(RRI_cleaved_filtered, by = "RRI") %>% distinct(RRI)
+  count_shared <- shared_rris %>% summarise(count = n()) %>% pull(count)
+  
+  # Unique RRIs only in each data frame
+  unique_only_noncleaved <- unique_noncleaved - count_shared
+  unique_only_cleaved <- unique_cleaved - count_shared
+  
+  # Count Crosslink Types within Shared RRIs
+  # Assuming "Crosslink.Type" is present in both data frames and is consistent between them
+  # We'll retrieve it from the noncleaved data frame; alternatively, you can choose one
+  shared_with_type <- shared_rris %>%
+    inner_join(RRI_noncleaved_filtered, by = "RRI") %>%
+    select(RRI, Crosslink.Type)
+  
+  # Count the number of Intra and Inter types
+  count_intra <- shared_with_type %>%
+    filter(Crosslink.Type == "Intra") %>%
+    summarise(count = n()) %>%
+    pull(count)
+  
+  count_inter <- shared_with_type %>%
+    filter(Crosslink.Type == "Inter") %>%
+    summarise(count = n()) %>% 
+    pull(count)
+  
+  # Handle cases where there might be no Intra or Inter types
+  count_intra <- ifelse(length(count_intra) == 0, 0, count_intra)
+  count_inter <- ifelse(length(count_inter) == 0, 0, count_inter)
+  
+  # Return a named vector of counts, including the new metrics
+  c(
+    Total_Observations_RRI_noncleaved = total_noncleaved,
+    Total_Observations_RRI_cleaved = total_cleaved,
+    Unique_RRIs_RRI_noncleaved = unique_noncleaved,
+    Unique_RRIs_RRI_cleaved = unique_cleaved,
+    Shared_RRIs = count_shared,
+    Shared_RRIs_Intra = count_intra,
+    Shared_RRIs_Inter = count_inter,
+    Unique_RRIs_only_RRI_noncleaved = unique_only_noncleaved,
+    Unique_RRIs_only_RRI_cleaved = unique_only_cleaved
+  )
+}
+
+# Initialize an empty list to store results for each FDR level
+results_list <- list()
+
+# Iterate over each FDR level and compute counts
+for (fdr in names(fdr_levels)) {
+  counts <- compute_counts(RRI_noncleaved_full, RRI_clean, fdr_levels[[fdr]])
+  results_list[[fdr]] <- counts
+}
+
+# Convert the list to a data frame
+summary_df <- bind_rows(results_list, .id = "FDR") %>%
+  pivot_longer(
+    cols = -FDR,
+    names_to = "Metric",
+    values_to = "Count"
+  ) %>%
+  pivot_wider(
+    names_from = FDR,
+    values_from = Count
+  )
+
+# Optional: Arrange the metrics in a specific order
+metric_order <- c(
+  "Total_Observations_RRI_noncleaved",
+  "Total_Observations_RRI_cleaved",
+  "Unique_RRIs_RRI_noncleaved",
+  "Unique_RRIs_RRI_cleaved",
+  "Shared_RRIs",
+  "Shared_RRIs_Intra",
+  "Shared_RRIs_Inter",
+  "Unique_RRIs_only_RRI_noncleaved",
+  "Unique_RRIs_only_RRI_cleaved"
+)
+
+summary_df <- summary_df %>%
+  mutate(Metric = factor(Metric, levels = metric_order)) %>%
+  arrange(Metric)
+
+# Replace underscores with spaces for better readability
+summary_df$Metric <- gsub("_", " ", summary_df$Metric)
+
+# (Optional) Rename Metrics for Clarity
+summary_df$Metric <- case_when(
+  summary_df$Metric == "Total Observations RRI noncleaved" ~ "Total Observations (noncleaved)",
+  summary_df$Metric == "Total Observations RRI cleaved" ~ "Total Observations (Cleaved)",
+  summary_df$Metric == "Unique RRIs RRI noncleaved" ~ "Unique RRIs (noncleaved)",
+  summary_df$Metric == "Unique RRIs RRI cleaved" ~ "Unique RRIs (Cleaved)",
+  summary_df$Metric == "Shared RRIs" ~ "Shared RRIs",
+  summary_df$Metric == "Shared RRIs Intra" ~ "Shared RRIs (Intra)",
+  summary_df$Metric == "Shared RRIs Inter" ~ "Shared RRIs (Inter)",
+  summary_df$Metric == "Unique RRIs only RRI noncleaved" ~ "Unique RRIs Only (noncleaved)",
+  summary_df$Metric == "Unique RRIs only RRI cleaved" ~ "Unique RRIs Only (Cleaved)",
+  TRUE ~ summary_df$Metric
+)
+
+# Display the summary table
+summary_df
+```
+
+#condense pLink RRI into PPI by grouping by PPI, count the unique R-R, then count the total spectrum
+#calculate number of unique intralinks before condensing for nural network
+```{r}
+#before condensing, 
+#calculate number of unique intralinks for each protein at FDR <10% to use for feature
+intracalc <- RRI_noncleaved_FDR10 %>%
+    filter(Crosslink.Type == "Intra") %>%
+    mutate(Accession.A = str_remove_all(Accession.A, "\\s*\\([^)]*\\)"))%>% #remove residue info in ()
+  group_by(Accession.A) %>%
+  mutate(number_unique_intra = n()) %>%
+  ungroup()%>%  # Optionally, remove the grouping information
+  group_by(Accession.A) %>%
+    # Select the row with the highest 'Best.CSM.Score' for each 'PPI'
+    filter(Score == max(Score)) %>%
+    ungroup() %>%
+    distinct(Accession.A, .keep_all = TRUE)%>% #remove redundancy
+    select(Accession.A, number_unique_intra) #select ID and interlink number
+
+#Create a function process_PPI that encapsulates the data manipulation steps.
+#This function takes two arguments:
+#data: The input data frame (e.g., RRI_noncleaved_FDR10)
+#confidence_q: The desired Confidence.Q value (e.g., 3)
+process_PPI <- function(data, confidence_q) {
+  data %>%
+    group_by(PPI) %>%
+    mutate(
+      number_unique_RR = n(), # Count the unique Residue to Residue interactions
+      Number.of.CSMs = sum(Number.of.CSMs, na.rm = TRUE), # Sum all CSMs within the group
+      #create crosslinks for XlinkCyNET
+      crosslinks_ab = paste(Accession.A, In.protein.A, Accession.B, In.protein.B, sep = "-", collapse = "#"),
+      score_ab = paste(Score, collapse = "#")
+    ) %>%
+    filter(Score == max(Score, na.rm = TRUE)) %>% # Keep only the highest Score per PPI
+    ungroup() %>%
+    mutate(PPI.Score = Score) %>% # Rename Score to Best.CSM.Score
+    select(-c(
+      Unique_Peptide_Number,
+      Protein,
+      In.protein.A,
+      In.protein.B,
+      Sequence.A,
+      Sequence.B,
+      Position.A,
+      Position.B,
+      Score
+    )) %>%
+    # Format for Cytoscape
+    mutate(
+      Accession.A = str_remove_all(Accession.A, "\\s*\\([^)]*\\)"), # Remove parenthetical content from Accession.A
+      Accession.B = str_remove_all(Accession.B, "\\s*\\([^)]*\\)"), # Remove parenthetical content from Accession.B
+      Confidence.Q = confidence_q # Assign the specified Confidence.Q value
+    )
+}
+
+#Apply the Function to Each Dataset
+#Use the process_PPI function to process each of your datasets (FDR10, FDR05, and FRD01) with their respective Confidence.Q values.
+
+# Process FDR10 with Confidence.Q = 3
+PPI_condensed_FDR10 <- process_PPI(RRI_noncleaved_FDR10, 3)
+# Process FDR05 with Confidence.Q = 4
+PPI_condensed_FDR05 <- process_PPI(RRI_noncleaved_FDR05, 4)
+# Process FRD01 with Confidence.Q = 5
+PPI_condensed_FDR01 <- process_PPI(RRI_noncleaved_FDR01, 5)
+
+#After making PPI_condensed_FDR10, 05, 01, merge them
+#merge PPI with FDR 1, 5, 10 %.
+PPI_noncleaved_full <- PPI_condensed_FDR10 %>%
+  mutate(Confidence.Q = if_else(PPI %in% PPI_condensed_FDR05$PPI, 4, Confidence.Q)) %>%
+  mutate(Confidence.Q = if_else(PPI %in% PPI_condensed_FDR01$PPI, 5, Confidence.Q)) %>%
+  mutate(MS = "noncleaved") %>% #add MS designation
+  filter(Crosslink.Type == "Inter") #get rid of intralinks
+
+#append unique intralinks (keep the smaller of two to represent the uncertinity of the peptide)
+PPI_noncleaved_full <- PPI_noncleaved_full %>%
+  left_join(intracalc, by = "Accession.A") %>%
+  left_join(intracalc, by = c("Accession.B" = "Accession.A"))%>%
+  # Replace NA with 0 and compute the minimum of 'number_unique_intra.x' and 'number_unique_intra.y'
+  mutate(number_unique_intra.min = pmin(replace_na(number_unique_intra.x, 0), replace_na(number_unique_intra.y, 0), na.rm = TRUE)) %>%
+  mutate(number_unique_intra.hm = 2 * (number_unique_intra.x * number_unique_intra.y)/(number_unique_intra.x + number_unique_intra.y)) %>%
+  # Remove the old columns 'number_unique_intra.x' and 'number_unique_intra.y'
+  select(-number_unique_intra.x, -number_unique_intra.y)
+```
+
+#compare non-cleaved and cleaved PPIs
+```{r}
+#this is the cleaved PPI table
+PPI_cleaved_full <- PPI_clean #read.table("PPI_Cleaved_woFeatures_20250610.txt", sep = "\t", header = TRUE, quote = "")
+
+#set the FDR 
+PPI_cleaved <- PPI_cleaved_full %>% filter(Crosslink.Type == "Inter") %>% filter(Confidence.Q >= 4)
+PPI_noncleaved <- PPI_noncleaved_full %>% filter(Crosslink.Type == "Inter")  %>% filter(Confidence.Q >=4) 
+
+# Total number of observations
+total_noncleaved <- PPI_noncleaved %>% summarise(count = n()) %>% pull(count)
+total_cleaved <- PPI_cleaved %>% summarise(count = n()) %>% pull(count)
+
+# Total unique PPIs
+unique_noncleaved <- PPI_noncleaved %>% distinct(PPI) %>% summarise(count = n()) %>% pull(count)
+unique_cleaved <- PPI_cleaved %>% distinct(PPI) %>% summarise(count = n()) %>% pull(count)
+
+# Shared PPIs
+shared_ppis <- PPI_noncleaved %>% inner_join(PPI_cleaved, by = "PPI") %>% distinct(PPI)
+count_shared <- shared_ppis %>% summarise(count = n()) %>% pull(count)
+
+# Unique PPIs only in each data frame
+unique_only_noncleaved <- unique_noncleaved - count_shared
+unique_only_cleaved <- unique_cleaved - count_shared
+
+# Create summary data frame
+summary_df <- tibble(
+  Metric = c(
+    "Total Observations in PPI_noncleaved",
+    "Total Observations in PPI_cleaved",
+    "Unique PPIs in PPI_noncleaved",
+    "Unique PPIs in PPI_cleaved",
+    "Shared PPIs between PPI_noncleaved and PPI_cleaved",
+    "Unique PPIs only in PPI_noncleaved",
+    "Unique PPIs only in PPI_cleaved"
+  ),
+  Count = c(
+    total_noncleaved,
+    total_cleaved,
+    unique_noncleaved,
+    unique_cleaved,
+    count_shared,
+    unique_only_noncleaved,
+    unique_only_cleaved
+  )
+)
+
+# View the summary data frame
+print(summary_df)
+```
+#Export Cleaved/noncleaved PPI to Cytoscape visualization
+```{r}
+#export for Cytoscape
+write.table(PPI_noncleaved_full, "PPI_Cytoscape.noncleaved.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(PPI_cleaved_full %>% 
+              filter(Crosslink.Type == "Inter") %>%
+              select(Accession.A, Accession.B, Number.of.CSMs, Confidence.Q) %>%
+              filter(Confidence.Q != (1 | 2)), "PPI_Cytoscape.cleaved.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+###############################################################
+#this is true merged data for Machine Learning / Cytoscape!
+#Combine PPI cleaved and noncleaved at PPI level for ML
+```{r}
+PPI_full <- full_join(PPI_cleaved_full %>% filter(Crosslink.Type == "Inter"), 
+                      PPI_noncleaved_full %>% filter(Crosslink.Type == "Inter"), 
+                      join_by(PPI)) %>%
+    mutate(
+      MS = case_when( #MS is the MS detection methods
+      !is.na(MS.x) & !is.na(MS.y) ~ "both",  # Both values exist
+      !is.na(MS.x) & (is.na(MS.y)) ~ MS.x, # Only MS.x exists
+      is.na(MS.x) & !is.na(MS.y) ~ MS.y,                   # Only MS.y exists
+      TRUE ~ NA_character_),) %>%
+    #select larger of Confidence Q between cleaved and uncleaved
+    mutate(Confidence.Q = pmax(Confidence.Q.x, Confidence.Q.y, na.rm = TRUE)) %>%
+ #Add Number of CSMs
+    mutate(Number.of.CSMs = rowSums(select(., Number.of.CSMs.x, Number.of.CSMs.y), na.rm = TRUE)) %>%
+    mutate(number_unique_RR = rowSums(select(., number_unique_RR.x, number_unique_RR.y), na.rm = TRUE)) %>%
+   #get rid of non-relevant columns
+    select(c(
+      Confidence.Q, Accession.A.x, Accession.B.x, PPI, Accession.A.y, Accession.B.y, MS, 
+      Number.of.CSMs, number_unique_RR, number_unique_intra.min.x, number_unique_intra.min.y, PPI.Score.x, PPI.Score.y)
+      ) %>%
+  # Replace NA in all .x columns with corresponding .y columns
+  mutate(across(ends_with(".x"), ~ coalesce(.x, get(sub("\\.x$", ".y", cur_column()))))) %>%
+  # rename all columns that end with .x and remove the .x from the name 
+  rename_with(
+    .fn = ~ str_replace(., "\\.x$", ""),  # Function to remove '.x' at the end
+    .cols = ends_with(".x")                # Select columns that end with '.x'
+              ) %>%
+  #select usable columns and clean up
+  select(-c(Accession.A.y, Accession.B.y, PPI.Score.y, number_unique_intra.min.y))
+```
+######################################################################################
+#from here use the NeuralNetwork PPI script to get the prediction
+#load the features and STRING, append it, then engineer it for prediction
+```{r}
+#Read the features into a text file if skipping the feature set creation
+featureDF <- read.table(file = "ToxoDB67_AllFeature_woSTRING.txt", sep = "\t", header = TRUE)
+STRINGdf <- read.table(file = "ToxoDB67_AllSTRING.txt", sep = "\t", header = TRUE)
+#append featureDF to the main XLMS data frame
+df <- PPI_full %>%
+  left_join(featureDF, by = c("Accession.A" = "Gene_ID"))%>%
+  left_join(featureDF, by = c("Accession.B" = "Gene_ID"))%>%
+  left_join(STRINGdf, by = "PPI") %>%
+  rename(STRING.score = combined_score) #rename the column name score to reflect STRING
+#Checking if there is any match in GO term, hyperLOPIT, etc.
+#Define the Matching Function: We'll start with the matching function. It checks for any common elements between two semicolon-separated strings.
+
+find_matches_boolean <- function(x, y) {
+  # Convert inputs to character, in case they are not
+  x <- as.character(x)
+  y <- as.character(y)
+  
+  # Pre-calculate NA or "0" check
+  na_or_zero_check <- is.na(x) || is.na(y) || (x == "0" && y == "0")
+  
+  # Split the strings into vectors based on the ";" delimiter, if not NA or "0"
+  if (!na_or_zero_check) {
+    items_x <- unlist(strsplit(x, split = ";", fixed = TRUE))
+    items_y <- unlist(strsplit(y, split = ";", fixed = TRUE))
+    
+    # Return TRUE if there are any matches, taking into account the NA or "0" check
+    return(length(intersect(items_x, items_y)) > 0)
+  } else {
+    # Return NA if either input is NA or both are "0"
+    return(NA)
+  }
+}
+
+#Identify and Process Column Pairs: We'll identify the pairs of columns that need to be compared and then iterate over these pairs, applying the matching function to each pair and storing the result in a new column.
+# Extract column names
+col_names <- names(df)
+
+# Identify unique prefixes by removing the trailing .x and .y
+prefixes <- unique(sub("\\.(x|y)$", "", col_names))
+
+# Filter out prefixes to ensure both .x and .y versions exist
+valid_prefixes <- prefixes[sapply(prefixes, function(prefix) {
+  all(c(paste0(prefix, ".x"), paste0(prefix, ".y")) %in% col_names)
+})]
+
+# Iterate over each valid prefix and compare the .x and .y columns
+for (prefix in valid_prefixes) {
+  x_col <- paste0(prefix, ".x")
+  y_col <- paste0(prefix, ".y")
+  match_col <- paste0(prefix, "_matches") # New column for match results
+  
+  # Apply the matching function to each row for the current pair of columns
+  df[[match_col]] <- mapply(find_matches_boolean, df[[x_col]], df[[y_col]], SIMPLIFY = TRUE)
+}
+
+
+# Define the function Q(x, y) for calculating absolute difference, 2x if they are + and -
+Q <- function(x, y) {
+  D <- abs(x - y)
+  delta <- ifelse(sign(x) != sign(y), 1, 0)
+  Q_value <- D * (1 + delta)
+  return(Q_value)
+}
+
+#calculate absolute difference between CRISPR score, 2X if they are + and -
+df <- df %>%
+  mutate(CRISPR.x = as.numeric(CRISPR.x),
+         CRISPR.y = as.numeric(CRISPR.y),
+         CRISPR.dif = Q(CRISPR.x, CRISPR.y))
+#calculate absolute difference between Non synonimous synonimous SNP ratio, 2X if they are + and -
+df <- df %>%
+  mutate(NonSyn_Syn_SNP_Ratio_All_Strains_c.x = as.numeric(NonSyn_Syn_SNP_Ratio_All_Strains_c.x),
+         NonSyn_Syn_SNP_Ratio_All_Strains_c.y = as.numeric(NonSyn_Syn_SNP_Ratio_All_Strains_c.y),
+        NonSyn_Syn_SNP_Ratio_All_Strains.dif = Q(NonSyn_Syn_SNP_Ratio_All_Strains_c.x, NonSyn_Syn_SNP_Ratio_All_Strains_c.y))
+
+#calculate minimum for RNAseq # Calculate the minimum of RnaSeq.x and RnaSeq.y
+df <- df %>%
+  rowwise() %>%
+  mutate(RnaSeq.min = min(c(RnaSeq.x, RnaSeq.y), na.rm = TRUE)) %>%
+  ungroup()
+
+#get rid of unnecessary columns
+df <- df %>% select(
+  PPI,
+  Accession.A,
+  Accession.B,
+  Confidence.Q,
+  MS,
+  number_unique_RR,
+  Number.of.CSMs,
+  number_unique_intra.min,
+  #number_unique_intra.hm,
+  Computed_GO_Component_IDs_c_matches,
+  Computed_GO_Function_IDs_c_matches,
+  Computed_GO_Process_IDs_c_matches,
+  EC_numbers_from_OrthoMCL_c_matches,
+  PFam_ID_c_matches,
+  ToxoNET_matches,
+  Location_matches,
+  CRISPR.dif,
+  NonSyn_Syn_SNP_Ratio_All_Strains.dif,
+  RnaSeq.min,
+  STRING.score,
+  PPI.Score
+)
+
+#Write the data frame into a text file
+write.table(df, file = "PPI_full_wFeatures.txt", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+```
+
+###After lightGBM Predicted###################################
+#Use the cleaved model to predict combined data frame
+```{r}
+raw_pred <- read.table("PPI_full_wFeatures_with_lightGBM_probabilities.tsv", header = TRUE, sep = "\t") 
+name.df <- read.table("GeneNameLookupTableTxHu.tsv", header = TRUE, sep = "\t", quote   = "") %>%
+          select(c(gene, gene_product)) %>%
+          distinct(gene, .keep_all = TRUE) #remove duplicate Toxo genes
+PPI_pred <- raw_pred %>% 
+  select(Accession.A, Accession.B, Confidence.Q, number_unique_RR, Number.of.CSMs, PPI, MS, lightGBM_prob) %>%
+  filter(Confidence.Q != 1) %>%
+  left_join(name.df, by = c("Accession.A" = "gene")) %>%
+  left_join(name.df, by = c("Accession.B" = "gene"))
+
+#Salvage the low score hits with high probability
+
+# define your filter condition once
+PPI_pred_filtered <- PPI_pred %>% filter(Confidence.Q == 5 & lightGBM_prob > 0 | #high FDR < 1 (Q=5)
+                                   (Confidence.Q == 4 & lightGBM_prob > 0.1) | #medium FDR < 5 (Q=4)
+                                   (Confidence.Q == 3 & lightGBM_prob > 0.8)| #low FDR <10 (Q=3)
+                                    (Confidence.Q == 2 & lightGBM_prob > 0.98) #purgatory FDR <30 (Q=2)
+                              )
+PPI_pred_out <- PPI_pred %>% filter(
+  !(
+    (Confidence.Q == 5 & lightGBM_prob > 0 | #high FDR < 1 (Q=5)
+                                   (Confidence.Q == 4 & lightGBM_prob > 0.1) | #medium FDR < 5 (Q=4)
+                                   (Confidence.Q == 3 & lightGBM_prob > 0.8)| #low FDR <10 (Q=3)
+                                    (Confidence.Q == 2 & lightGBM_prob > 0.98) #purgatory FDR <30 (Q=2)
+                              )
+  ))
+
+# Count observations grouped by Confidence.Q for both data frames
+filtered_counts <- PPI_pred_filtered %>% count(Confidence.Q, name = "Count") %>% mutate(Source = "filtered")
+filtered_non_counts <- PPI_pred_filtered %>% 
+  filter(MS == "noncleaved") %>%
+  count(Confidence.Q, name = "Count") %>% mutate(Source = "filtered_non_pred")
+raw_pred_counts <- raw_pred %>% count(Confidence.Q, name = "Count") %>% mutate(Source = "raw_pred")
+raw_non_counts <- raw_pred %>% 
+  filter(MS == "noncleaved") %>%
+  count(Confidence.Q, name = "Count") %>% mutate(Source = "raw_non_pred")
+
+# Combine into one table
+combined_counts <- bind_rows(filtered_counts, raw_pred_counts, filtered_non_counts, raw_non_counts)
+
+combined_counts %>%
+  pivot_wider(names_from = Source, values_from = Count, values_fill = 0)%>%
+  arrange(Confidence.Q)  # Sorting based on Confidence.Q
+
+# Save PPI table with LightGBM probabilities for publication
+write.table(PPI_pred, file = "PPI_PRED_SupplimentaryTable.tsv", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+# Save file for Interactome Cytoscape
+write.table(PPI_pred_filtered, file = "PPI_PRED_Cytoscape_0.98.tsv", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+```
+#### Calculation of Agreement
+
+```{r}
+#Read the file that has PPI and features that include feature matches
+ag.df <- read.table(file = "PPI_full_wFeatures.txt", header = TRUE) %>%
+  # make STRING score matches based on the cutoff. probabilit 0.5 is the score 500
+  mutate(
+    STRING_matches = case_when(
+      is.na(STRING.score)       ~ NA,          # keep NA
+      STRING.score >  500       ~ TRUE,        # high‐confidence
+      TRUE                      ~ FALSE        # everything else (≤500)
+    )
+  )
+
+
+# get the counts of agreement
+ag.counts <-  ag.df %>% group_by(Confidence.Q) %>%
+  summarise(
+    across(
+      ends_with("_matches"),
+      list(
+        TRUE_count  = ~ sum(. == TRUE,  na.rm = TRUE),
+        FALSE_count = ~ sum(. == FALSE, na.rm = TRUE),
+        NA_count    = ~ sum(is.na(.))
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+# get the percentage TRUE/(TRUE+FALSE)*100 of agreement wihout NA
+ag.percent <-  ag.df %>%
+  group_by(Confidence.Q) %>%
+  summarise(
+    across(
+      ends_with("_matches"),
+      ~ {
+        n_true  <- sum(. == TRUE,  na.rm = TRUE)
+        n_false <- sum(. == FALSE, na.rm = TRUE)
+        100 * n_true / (n_true + n_false)
+      },
+      .names = "{.col}_pct_true"
+    ),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Confidence.Q))
+```
+
+
+
+
+#### Dimer detection
+#Prerequisit: need RRI_full that has all the residue-to-residue interaction
+```{r}
+#revive RRI_full from a file
+RRI_full <- read.table("RRI.full.csv", header = TRUE, sep = "\t", quote   = "")
+
+dimer_df <- RRI_full %>%
+  filter(Confidence.Q >= 3)%>% #FDR <5%
+  filter(Accession.A == Accession.B) %>%
+    #there are multiple positions due to the multiple protein mapping to a peptide sequence
+  mutate(
+    # Extract the first number before ";" and convert to numeric
+    In.protein.A = as.numeric(str_split(In.protein.A, ";", simplify = TRUE)[,1]),
+    In.protein.B = as.numeric(str_split(In.protein.B, ";", simplify = TRUE)[,1]),
+
+    # Calculate Peptide.A.Start and Peptide.B.Start
+    Peptide.A.Start = In.protein.A - Position.A + 1,
+    Peptide.B.Start = In.protein.B - Position.B + 1,
+    
+    # Extract substring after ']' in Sequence.A and Sequence.B
+    # and calculate Peptide.A.End and Peptide.B.End
+    Peptide.A.End = In.protein.A + str_length(str_remove(Sequence.A, "^.*\\]")),
+    Peptide.B.End = In.protein.B + str_length(str_remove(Sequence.B, "^.*\\]")),
+    
+    # Determine if there is any overlap between the peptide ranges
+    Dimer = (Peptide.A.Start <= Peptide.B.End) & (Peptide.B.Start <= Peptide.A.End)
+  ) %>%
+    filter(Dimer == TRUE)
+
+#concatenate the dimer and create number of RRI per dimerized gene
+dimer_detect <- dimer_df %>%
+  group_by(Accession.A) %>%
+  summarise(dimer_RRI = n(),
+            crosslinks_ab = paste(Accession.A, In.protein.A, Accession.B, In.protein.B, sep = "-", collapse = "#"),
+            score_ab = paste(Confidence.Q, collapse = "#")
+            ) %>%
+  ungroup() 
+
+gene.name <- read.table(file = "GeneNameLookupTableTxHu.csv", sep = "\t", header = TRUE, quote = "") %>%
+    distinct(gene, .keep_all = TRUE)
+
+#add gene description to the summary
+dimer_detect <- dimer_detect %>%
+  left_join(gene.name, by = c("Accession.A" = "gene")) %>%
+  #XlinkCyNET format
+  mutate(
+  gene_a = Accession.A,
+  gene_b = Accession.A,
+  ppi_score = as.numeric(score_ab) * as.numeric(dimer_RRI),
+  crosslinks_ba = crosslinks_ab,
+  score_ba = score_ab,
+  protein_a = gene_a,
+  protein_b = gene_b
+)
+
+#add gene description to the dimer data frame
+dimer_df <- dimer_df %>%
+  left_join(gene.name, by = c("Accession.A" = "gene"))
+
+#write the summary of dimer
+write.table(dimer_detect,
+  file = "dimer_detect.tsv",    # summary of dimers
+  sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE)
+
+#write actual dimer RRI
+write.table(dimer_df,
+  file = "dimer_df.tsv",    # this is detailed RRI for dimers
+  sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE)
+```
+
+select any dimers that are GRA7 
+```{r}
+GRA7.dimer <- dimer_df %>% filter(Accession.A == "TGME49_203310")
+```
+GRA2
+```{r}
+GRA2.dimer <- dimer_df %>% filter(Accession.A == "TGME49_227620")
+```
+GRA3
+```{r}
+GRA3.dimer <- dimer_df %>% filter(Accession.A == "TGME49_227280")
+```
+
+#Toxofilin/Actin cytoplasmic 1 ACTB (P63261)
+actins have many isoforms so just focus on one gene ACTB which has most hits
+```{r}
+toxofilin.df <- read.table("20240908_All_for_publication-TxHu_Crosslinks.txt", header = TRUE, sep = "\t") %>%
+  filter(Decoy != "True",
+         Crosslink.Type == "Inter",
+         str_detect(Accession.A, "TGME49_214080")|str_detect(Accession.B, "TGME49_214080")) %>%
+  #separate multiple hits into separate observations
+  separate_rows(Accession.A, In.protein.A, sep = ";") %>% #split multiple observations in peptide A
+  mutate(Accession.A = str_trim(Accession.A)) %>% #remove the white space
+  separate_rows(Accession.B, In.protein.B, sep = ";") %>% #split multiple observations in peptide B
+  mutate(Accession.B = str_trim(Accession.B)) %>% #remove the white space
+  filter(str_detect(Accession.A, "P63261") | str_detect(Accession.B, "P63261")) %>% #filter actins
+  #collaps to RRI
+  rowwise() %>%
+  mutate(
+    RRI = {
+      # build the two “protein:position” strings on the fly
+      R1 <- str_c(Accession.A, In.protein.A, sep = ":")
+      R2 <- str_c(Accession.B, In.protein.B, sep = ":")
+      # sort them and paste with “-”
+      paste(sort(c(R1, R2)), collapse = "-")
+    }
+  ) %>%
+  ungroup() %>%
+  # --- (b) Aggregate all peptide‐level entries sharing the same RRI --- #
+  group_by(RRI) %>%
+  mutate(Number.of.CSMs = sum(Number.of.CSMs)) %>%
+  slice_max(order_by = Best.CSM.Score, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+#write the table for tosofilin/actin RRI
+write.table(toxofilin.df,
+  file = "toxofilin-actin-RRI.tsv",    # this is detailed RRI for dimers
+  sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE)
+```
+
+
+####
+#xiView Export for GRA network
+```{r}
+#read the gene list that is generated by Cytoscape GRA1 network
+gra.list <- read.csv(file = "GRA network default node.csv")
+# read RRI data from a file
+xiview.df <- read.csv("RRI.full.csv", header = TRUE, sep = "\t", quote = "") %>%
+  filter(Confidence.Q >= 2) %>% #just get medium + high confidence (FDR < 5%)
+  # keep only rows where Accession.A or Accession.B appears in gra.list$name
+  filter(Accession.A %in% gra.list$name &
+         Accession.B %in% gra.list$name) %>%
+#Convert RRI to xiView format
+  # remove [] from the peptide sequences
+  mutate(across(c(Sequence.A, Sequence.B), ~ stringr::str_remove_all(., "\\[|\\]"))) %>%
+  #calculate Peptide position by In.protein.A - Position.A + 1
+    mutate(
+    PepPos1 = as.numeric(In.protein.A) - as.numeric(Position.A) + 1,
+    PepPos2 = as.numeric(In.protein.B) - as.numeric(Position.B) + 1
+  ) %>%
+  #rename Sequence.A and Sequence.B to PepSeq1 and PepSeq2, Position.A and Position.B to PepPos1 and PepPos2
+  rename(PepSeq1 = Sequence.A,
+         PepSeq2 = Sequence.B,
+         LinkPos1 = Position.A,
+         LinkPos2 = Position.B,
+         Protein1 = Accession.A,
+         Protein2 = Accession.B,
+         Score = Confidence.Q)
+
+#save the file for xiVIEW
+write.csv(xiview.df, "xiVIEW_GRA_exclusive.csv", row.names = FALSE, quote = FALSE)
+```
